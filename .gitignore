@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+env/
+
+# Logs & runtime
+logs/
+*.log
+router.pid
+
+# Experiment outputs
+*.csv
+*.json
+*.jsonl
+
+# Generated / temp
+overnight_*/
+experiments_summary/
+
+# OS
+.DS_Store
