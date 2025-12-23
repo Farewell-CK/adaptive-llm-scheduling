@@ -1,5 +1,7 @@
 # AdaSplit: Adaptive Split-Scheduling for Mixed-Workload LLM Inference
 
+[中文文档 (Chinese Version)](README_CN.md)
+
 **AdaSplit** is a dynamic resource partitioning framework designed to optimize Large Language Model (LLM) inference performance under mixed workloads (combining short conversational chats and long-context analysis tasks).
 
 ## 🎯 Goal

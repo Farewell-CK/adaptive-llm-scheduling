@@ -1,5 +1,7 @@
 # AdaSplit: 混合负载下的自适应 LLM 推理资源分区
 
+[English Version](README.md)
+
 **AdaSplit** 是一个动态资源分区框架，旨在优化混合负载（即短文本对话与长文本分析混合）下的大模型推理性能。
 
 ## 🎯 项目目标
