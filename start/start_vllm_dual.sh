@@ -228,8 +228,8 @@ start_router() {
 
     local router_script=""
     case "${ROUTER_IMPL}" in
-        smart)  router_script="${TOOLS_DIR}/router_smart.py" ;;
-        static) router_script="${WORKSPACE_DIR}/router_static.py" ;;
+        smart)  router_script="${TOOLS_DIR}/routers/router_smart.py" ;;
+        static) router_script="${TOOLS_DIR}/routers/router_static.py" ;;
         *)
             echo "❌ ERROR: Unknown ROUTER_IMPL='${ROUTER_IMPL}' (expected smart|static)" >&2
             exit 1
