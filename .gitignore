@@ -20,6 +20,7 @@ router.pid
 # Generated / temp
 overnight_*/
 experiments_summary/
+experiments/
 
 # OS
 .DS_Store
