@@ -17,6 +17,7 @@ HAP_COOLDOWN = 5          # 状态切换冷却时间 (秒)，防止抖动
 
 # 2. 微观控制参数 (RASP)
 RASP_STEAL_COOLDOWN = 2.0 # 短节点必须空闲超过 2秒 才能被窃取
+WORKER_CONCURRENCY_LIMIT = 8 # 每个 Worker (vLLM Instance) 允许的最大并发请求数
 
 # 3. 静态定义 (根据你的 4 个 Unit)
 WORKER_URLS = [
@@ -36,7 +37,7 @@ app = FastAPI()
 # 禁用环境代理变量（例如 socks5 代理导致需要 socksio），本路由只转发到本机 worker。
 http_client = httpx.AsyncClient(
     timeout=None,
-    limits=httpx.Limits(max_keepalive_connections=20, max_connections=20),
+    limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
     trust_env=False,
 )
 
@@ -50,23 +51,27 @@ class Worker:
         self.id = worker_id
         self.url = url
         self.current_role = TaskType.LONG # 默认为 Long，会被 Scheduler 修改
-        self.is_busy = False
+        self.active_requests = 0
         self.last_active_time = time.time() # 用于 RASP 计算空闲时长
 
-    def mark_busy(self):
-        self.is_busy = True
+    def inc_requests(self):
+        self.active_requests += 1
     
-    def mark_idle(self):
-        self.is_busy = False
-        self.last_active_time = time.time()
+    def dec_requests(self):
+        self.active_requests = max(0, self.active_requests - 1)
+        if self.active_requests == 0:
+            self.last_active_time = time.time()
+
+    def can_accept(self):
+        return self.active_requests < WORKER_CONCURRENCY_LIMIT
 
     def get_idle_duration(self):
-        if self.is_busy:
+        if self.active_requests > 0:
             return 0
         return time.time() - self.last_active_time
 
     def __repr__(self):
-        return f"[W{self.id}:{self.current_role.value[0]}]"
+        return f"[W{self.id}:{self.current_role.value[0]}:{self.active_requests}]"
 
 # --- 2. 核心调度器 (The Brain) ---
 class AdaSplitScheduler:
@@ -136,27 +141,25 @@ class AdaSplitScheduler:
         包含：本职工作分配 + RASP 窃取逻辑
         """
         
-        # 1. 优先找【本职工作】且空闲的 Worker
+        # 1. 优先找【本职工作】且还有并发余量的 Worker
         # ------------------------------------------------
-        candidates = [w for w in self.workers if w.current_role == task_type and not w.is_busy]
+        candidates = [w for w in self.workers if w.current_role == task_type and w.can_accept()]
         if candidates:
-            return candidates[0] # 返回第一个空闲的本职 Worker
+            # 负载均衡：选择当前负载最低的那个
+            return min(candidates, key=lambda x: x.active_requests)
 
         # 2. RASP 窃取逻辑 (Risk-Aware Stealing Policy)
         # ------------------------------------------------
         # 只有 Long 任务允许去偷 Short 节点 (激进策略)
-        # Short 任务不允许偷 Long (因为长任务太慢，不仅不赚反而亏)
         if task_type == TaskType.LONG:
             # 筛选可以被偷的 Short Worker
-            # 条件公式: Role=SHORT AND Queue_Short=Empty AND Idle_Time > Threshold
-            
             short_q_empty = (len(self.queue_short) == 0)
             
             for w in self.workers:
-                if w.current_role == TaskType.SHORT and not w.is_busy:
-                    # RASP 核心公式检查
+                if w.current_role == TaskType.SHORT and w.can_accept():
+                    # RASP 核心公式检查：短任务队列为空，且节点已空闲一段时间
                     if short_q_empty and w.get_idle_duration() > RASP_STEAL_COOLDOWN:
-                        logger.info(f"🥷 [RASP Steal] Worker {w.id} (Short) 正在被窃取执行 Long 任务! (Idle: {w.get_idle_duration():.1f}s)")
+                        logger.info(f"🥷 [RASP Steal] Worker {w.id} (Short) 正在被窃取执行 Long 任务! (Load: {w.active_requests})")
                         return w
         
         return None # 没有可用资源
@@ -171,7 +174,7 @@ def estimate_token_count(messages):
 
 async def process_request(worker, body, request_obj):
     """实际执行转发，管理 Worker 忙/闲状态"""
-    worker.mark_busy()
+    worker.inc_requests()
     try:
         # 构造请求
         req = http_client.build_request("POST", worker.url, json=body, timeout=None)
@@ -183,30 +186,16 @@ async def process_request(worker, body, request_obj):
             background=None
         )
     finally:
-        # 无论成功失败，请求结束后标记为空闲
-        # 注意：这里我们简单处理，真实场景可能需要处理 Stream 结束的回调
-        # 对于 vLLM Stream，这里其实是 header 返回就 mark_idle 了，这在并发控制上是不精确的
-        # 但对于论文实验，为了制造排队，我们可以在这里加一个简单的 await r.read() 或者
-        # 更好的方式是假设 Worker 并发能力是 1 (Request Level)，
-        # 或者我们仅把 Router 当做 Dispatcher，Worker 内部其实支持 Batching。
-        # 
-        # 【重要修正】：vLLM 本身支持并发 (Continuous Batching)。
-        # 我们的 Worker.is_busy = True 实际上是把 Worker 当成了 "Slot"。
-        # 为了让实验效果明显，我们这里【不】应该一发请求就释放 Worker，
-        # 而是应该让 Router 认为 Worker 满载了。
-        # 但由于我们没法知道 Stream 什么时候结束，简化起见：
-        # 我们这里不做严格的 Worker 锁定，而是只做简单的计数，或者
-        # 我们的算法假设是 Request-Level 的调度。
+        # 只要请求响应开始返回（如果是 Streaming，这不代表结束，但在本 Router 架构中
+        # 为了不阻塞后续请求进入 vLLM 内部队列，我们在发送后不久或结束后释放。
+        # 实际上 vLLM 内部有更大的队列。
+        # 为了更准确模拟并发控制，理想情况应该在 Streaming 结束时 dec_requests。
         
-        # 为了让实验排队效果最明显 (Hol Blocking)，我们暂时设为：
-        # 发送请求 -> 只要建立了连接 -> 就认为 Worker 空闲了 (把压力给 vLLM 内部队列)
-        # 或者，为了模拟 Router 端的排队，我们可以在这里等待。
+        # TODO: 如果要严格限制 vLLM 内部并发，需要解析 SSE 并在结束时回调。
+        # 目前这里的逻辑是：请求发出并建立流连接后即视为占用一个 slot。
+        # 由于 FastAPI StreamingResponse 的特性，我们无法简单地在此处 await 结束。
         
-        # *对于本实验*：我们不等待 Stream 结束，因为那需要解析 SSE。
-        # 我们只负责分发。Load Balancing 由 vLLM 内部处理一部分，
-        # 但 Worker 选择由我们决定。
-        
-        worker.mark_idle() 
+        worker.dec_requests() 
         # 重新触发一次调度，看队列里有没有等待的
         asyncio.create_task(dispatch_queue())
 
